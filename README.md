@@ -22,6 +22,29 @@ uv sync
 
 ## Usage
 
+### Chat CLI (Easiest)
+
+Chat directly with your docs from the command line:
+
+```bash
+# With Ollama (local, no API key needed)
+uv run docs-chat /path/to/your/docs --ollama
+
+# With OpenAI
+uv run docs-chat /path/to/your/docs
+
+# Single question mode
+uv run docs-chat /path/to/your/docs --ollama -q "How do I install?"
+
+# Search mode (no AI, just find relevant sections)
+uv run docs-chat /path/to/your/docs --ollama -s "configuration"
+```
+
+Interactive mode commands:
+- Type questions to get AI answers with citations
+- `/search <query>` - search without AI generation
+- `quit` or `q` - exit
+
 ### With Claude Code
 
 Add to your project's `.mcp.json`:

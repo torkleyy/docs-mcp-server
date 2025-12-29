@@ -24,6 +24,9 @@ ollama = [
     "llama-index-embeddings-ollama",
 ]
 
+[project.scripts]
+docs-chat = "chat:main"
+
 [tool.setuptools]
 package-dir = {"" = "."}
 
