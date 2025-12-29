@@ -18,6 +18,12 @@ dependencies = [
     "openai",
 ]
 
+[project.optional-dependencies]
+ollama = [
+    "llama-index-llms-ollama",
+    "llama-index-embeddings-ollama",
+]
+
 [tool.setuptools]
 package-dir = {"" = "."}
 

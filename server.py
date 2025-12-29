@@ -28,11 +28,13 @@ OpenAI credentials are loaded from the environment as well; see
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,8 +45,6 @@ try:
     # will be raised here rather than at runtime in tool functions.
     from llama_index.core import Document, PromptTemplate, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
     from llama_index.core.node_parser import MarkdownNodeParser
-    from llama_index.embeddings.openai import OpenAIEmbedding
-    from llama_index.llms.openai import OpenAI
 except ImportError as exc:
     # Provide a clear error message if dependencies are missing.  This makes
     # it obvious during server startup which package is not installed.
@@ -53,18 +53,32 @@ except ImportError as exc:
         f"Missing dependency: {missing}. Please install required packages as described in the README."
     )
 
+# Provider-specific imports are deferred until we know which provider to use.
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Model provider configuration.  Set MODEL_PROVIDER to "ollama" to use local
+# models via Ollama, or "openai" (default) to use OpenAI's API.
+MODEL_PROVIDER: str = os.environ.get("MODEL_PROVIDER", "openai").lower()
 
 # Names of the OpenAI models to use.  Update these constants to swap
 # in different models without touching the retrieval logic.
 OPENAI_CHAT_MODEL: str = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL: str = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
+# Names of the Ollama models to use when MODEL_PROVIDER is "ollama".
+OLLAMA_CHAT_MODEL: str = os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2")
+OLLAMA_EMBEDDING_MODEL: str = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
 # The directory in which to persist the vector index.  Changing this will
 # rebuild the index from scratch if the directory does not already exist.
 PERSIST_DIR_NAME: str = ".vector_store"
+
+# File that tracks modification times for incremental index updates.
+METADATA_FILE_NAME: str = ".file_metadata.json"
 
 # The maximum length of a snippet returned to the client.
 SNIPPET_CHAR_LIMIT: int = 500
@@ -117,6 +131,112 @@ def _get_docs_dir() -> Path:
     return docs_path
 
 
+def _get_current_file_metadata(docs_path: Path) -> Dict[str, float]:
+    """Get modification times for all markdown files in the docs directory.
+
+    Args:
+        docs_path: The documentation directory.
+
+    Returns:
+        Dict mapping relative file paths to their modification times.
+    """
+    metadata: Dict[str, float] = {}
+    for file_path in docs_path.rglob("*"):
+        if file_path.suffix.lower() in {".md", ".mdx"}:
+            relative_path = str(file_path.relative_to(docs_path))
+            metadata[relative_path] = file_path.stat().st_mtime
+    return metadata
+
+
+def _load_stored_metadata(persist_dir: Path) -> Dict[str, float]:
+    """Load stored file metadata from disk.
+
+    Args:
+        persist_dir: The persistence directory.
+
+    Returns:
+        Dict mapping relative file paths to their stored modification times.
+    """
+    metadata_file = persist_dir / METADATA_FILE_NAME
+    if metadata_file.exists():
+        try:
+            return json.loads(metadata_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_metadata(persist_dir: Path, metadata: Dict[str, float]) -> None:
+    """Save file metadata to disk.
+
+    Args:
+        persist_dir: The persistence directory.
+        metadata: Dict mapping relative file paths to modification times.
+    """
+    metadata_file = persist_dir / METADATA_FILE_NAME
+    metadata_file.write_text(json.dumps(metadata, indent=2))
+
+
+def _detect_changes(
+    current: Dict[str, float], stored: Dict[str, float]
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Detect new, modified, and deleted files by comparing metadata.
+
+    Args:
+        current: Current file metadata (path -> mtime).
+        stored: Previously stored file metadata.
+
+    Returns:
+        Tuple of (new_files, modified_files, deleted_files) as sets of paths.
+    """
+    current_files = set(current.keys())
+    stored_files = set(stored.keys())
+
+    new_files = current_files - stored_files
+    deleted_files = stored_files - current_files
+    modified_files = {
+        f for f in current_files & stored_files
+        if current[f] != stored[f]
+    }
+
+    return new_files, modified_files, deleted_files
+
+
+def _parse_files_to_nodes(
+    docs_path: Path, file_paths: Set[str], parser: "MarkdownNodeParser"
+) -> List[Any]:
+    """Parse a set of markdown files into nodes.
+
+    Args:
+        docs_path: The documentation directory.
+        file_paths: Set of relative file paths to parse.
+        parser: The MarkdownNodeParser instance.
+
+    Returns:
+        List of parsed nodes.
+    """
+    documents: List[Document] = []
+    for relative_path in file_paths:
+        file_path = docs_path / relative_path
+        try:
+            text = file_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning("Skipping %s due to read error: %s", file_path, e)
+            continue
+        # Use file_path as the doc_id so we can delete by reference later
+        doc = Document(
+            text=text,
+            metadata={"file_path": relative_path},
+            doc_id=relative_path,
+        )
+        documents.append(doc)
+
+    if not documents:
+        return []
+
+    return parser.get_nodes_from_documents(documents)
+
+
 def _build_or_load_index(docs_path: Path) -> VectorStoreIndex:
     """Build a vector index from the given docs or load it from disk.
 
@@ -131,18 +251,88 @@ def _build_or_load_index(docs_path: Path) -> VectorStoreIndex:
         VectorStoreIndex: A LlamaIndex vector store built from the docs.
     """
     persist_dir = docs_path / PERSIST_DIR_NAME
+    provider_file = persist_dir / ".provider"
     storage_context: Optional[StorageContext] = None
 
-    # Configure embedding model and LLM globally via Settings
-    embed_model = OpenAIEmbedding(model=OPENAI_EMBEDDING_MODEL)
-    llm = OpenAI(model=OPENAI_CHAT_MODEL)
+    # Check if provider has changed since last index build
+    if persist_dir.exists() and provider_file.exists():
+        stored_provider = provider_file.read_text().strip()
+        if stored_provider != MODEL_PROVIDER:
+            logger.warning(
+                "Provider changed from '%s' to '%s'. Deleting incompatible index...",
+                stored_provider,
+                MODEL_PROVIDER,
+            )
+            shutil.rmtree(persist_dir)
+
+    # Configure embedding model and LLM globally via Settings based on provider
+    if MODEL_PROVIDER == "ollama":
+        try:
+            from llama_index.embeddings.ollama import OllamaEmbedding
+            from llama_index.llms.ollama import Ollama
+        except ImportError:
+            raise SystemExit(
+                "Ollama dependencies not installed. Run: uv sync --extra ollama"
+            )
+        logger.info("Using Ollama provider (host=%s)", OLLAMA_HOST)
+        embed_model = OllamaEmbedding(model_name=OLLAMA_EMBEDDING_MODEL, base_url=OLLAMA_HOST)
+        llm = Ollama(model=OLLAMA_CHAT_MODEL, base_url=OLLAMA_HOST)
+    else:
+        from llama_index.embeddings.openai import OpenAIEmbedding
+        from llama_index.llms.openai import OpenAI
+        logger.info("Using OpenAI provider")
+        embed_model = OpenAIEmbedding(model=OPENAI_EMBEDDING_MODEL)
+        llm = OpenAI(model=OPENAI_CHAT_MODEL)
+
     Settings.embed_model = embed_model
     Settings.llm = llm
+
+    parser = MarkdownNodeParser.from_defaults()
+    current_metadata = _get_current_file_metadata(docs_path)
 
     if persist_dir.exists() and any(persist_dir.iterdir()):
         logger.info("Loading existing index from %s", persist_dir)
         storage_context = StorageContext.from_defaults(persist_dir=str(persist_dir))
         index = load_index_from_storage(storage_context)
+
+        # Check for file changes and perform incremental update
+        stored_metadata = _load_stored_metadata(persist_dir)
+        new_files, modified_files, deleted_files = _detect_changes(
+            current_metadata, stored_metadata
+        )
+
+        if new_files or modified_files or deleted_files:
+            logger.info(
+                "Detected changes: %d new, %d modified, %d deleted files",
+                len(new_files),
+                len(modified_files),
+                len(deleted_files),
+            )
+
+            # Delete nodes for modified and deleted files
+            files_to_remove = modified_files | deleted_files
+            for file_path in files_to_remove:
+                try:
+                    index.delete_ref_doc(file_path, delete_from_docstore=True)
+                    logger.debug("Removed nodes for: %s", file_path)
+                except Exception as e:
+                    logger.warning("Failed to remove nodes for %s: %s", file_path, e)
+
+            # Parse and insert nodes for new and modified files
+            files_to_add = new_files | modified_files
+            if files_to_add:
+                new_nodes = _parse_files_to_nodes(docs_path, files_to_add, parser)
+                if new_nodes:
+                    index.insert_nodes(new_nodes)
+                    logger.info("Added %d nodes from %d files", len(new_nodes), len(files_to_add))
+
+            # Persist updated index and metadata
+            index.storage_context.persist(persist_dir=str(persist_dir))
+            _save_metadata(persist_dir, current_metadata)
+            logger.info("Index updated and persisted")
+        else:
+            logger.info("No file changes detected")
+
         return index
 
     logger.info("Building new index; this may take a while...")
@@ -160,7 +350,12 @@ def _build_or_load_index(docs_path: Path) -> VectorStoreIndex:
             logger.warning("Skipping %s due to read error: %s", file_path, e)
             continue
         relative_path = str(file_path.relative_to(docs_path))
-        documents.append(Document(text=text, metadata={"file_path": relative_path}))
+        # Use file_path as doc_id for incremental updates
+        documents.append(Document(
+            text=text,
+            metadata={"file_path": relative_path},
+            doc_id=relative_path,
+        ))
 
     if not documents:
         logger.error("No readable Markdown files found under %s", docs_path)
@@ -168,13 +363,15 @@ def _build_or_load_index(docs_path: Path) -> VectorStoreIndex:
 
     # Parse documents into nodes using the MarkdownNodeParser.  This splits
     # documents by heading and attaches a 'header_path' to the node metadata.
-    parser = MarkdownNodeParser.from_defaults()
     nodes = parser.get_nodes_from_documents(documents)
     logger.info("Parsed %d nodes from %d documents", len(nodes), len(documents))
 
     # Build the index in memory first, then persist to disk.
     index = VectorStoreIndex(nodes)
     index.storage_context.persist(persist_dir=str(persist_dir))
+    # Record provider and file metadata for change detection on next run
+    provider_file.write_text(MODEL_PROVIDER)
+    _save_metadata(persist_dir, current_metadata)
     logger.info("Index built and persisted at %s", persist_dir)
     return index
 

@@ -64,14 +64,52 @@ uv run python server.py
 
 | Variable | Required | Description |
 |----------|:--------:|-------------|
-| `OPENAI_API_KEY` | Yes | Your OpenAI API key |
 | `DOCS_DIR` | No | Path to Markdown folder (default: `./docs`) |
+| `MODEL_PROVIDER` | No | `openai` (default) or `ollama` |
+| `OPENAI_API_KEY` | Yes* | Your OpenAI API key (*not needed for Ollama) |
 | `OPENAI_API_BASE` | No | Override OpenAI API URL |
 | `OPENAI_CHAT_MODEL` | No | Chat model (default: `gpt-4o-mini`) |
 | `OPENAI_EMBEDDING_MODEL` | No | Embedding model (default: `text-embedding-3-small`) |
+| `OLLAMA_HOST` | No | Ollama server URL (default: `http://localhost:11434`) |
+| `OLLAMA_CHAT_MODEL` | No | Ollama chat model (default: `llama3.2`) |
+| `OLLAMA_EMBEDDING_MODEL` | No | Ollama embedding model (default: `nomic-embed-text`) |
+
+## Using Local Models (Ollama)
+
+For testing without OpenAI, you can use [Ollama](https://ollama.com) to run models locally.
+
+### Setup
+
+```bash
+# Install Ollama (macOS)
+brew install ollama
+
+# Start Ollama server
+ollama serve
+
+# Pull required models (~2GB total)
+ollama pull nomic-embed-text   # Embedding model (~274MB)
+ollama pull llama3.2           # Chat model (~2GB, or use llama3.2:1b for ~1.3GB)
+```
+
+### Install Ollama dependencies
+
+```bash
+uv sync --extra ollama
+```
+
+### Run with Ollama
+
+```bash
+export MODEL_PROVIDER=ollama
+export DOCS_DIR=/path/to/your/docs
+uv run python server.py
+```
 
 ## Notes
 
 - Only `.md` and `.mdx` files are indexed
-- Vector store is cached in `.vector_store/` under your docs folder—delete it to rebuild
+- Vector store is cached in `.vector_store/` under your docs folder—delete it to force full rebuild
 - First run takes longer due to embedding generation
+- **Incremental updates**: Changed/new/deleted markdown files are automatically detected on startup and only affected embeddings are rebuilt
+- Switching providers (OpenAI ↔ Ollama) automatically rebuilds the index since embeddings are incompatible
