@@ -1,3 +1,4 @@
 __pycache__
 .venv
 docs_mcp_server.egg-info/
+.claude/settings.local.json
